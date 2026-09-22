@@ -1,8 +1,7 @@
 from fastapi import FastAPI
 
-app = FastAPI()
+from api.routes import install_error_handlers, router as api_router
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = FastAPI(title="OTA Fleet Rollout", version="0.1.0")
+app.include_router(api_router)
+install_error_handlers(app)
