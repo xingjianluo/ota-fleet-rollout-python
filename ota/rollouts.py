@@ -80,7 +80,44 @@ class RolloutService:
         return {"rollout_id": r.rollout_id, "fw_id": r.fw_id,
                 "target_version": r.target_version,
                 "status": r.status.value, "batches": batches,
-                "halted_reason": r.halted_reason}
+                "halted_reason": r.halted_reason,
+                "stall": self._stall_overview(r)}
+
+    def _stall_overview(self, r: Rollout) -> dict:
+        """停滞概览：观察中 / 补救中 / 已搁置 三档计数与各自原因。
+
+        - observing：持续上报同一阶段（same_stage_reports>0）但尚未被
+          巡检判定，仍在停滞观察窗口内；
+        - remedying：已被看门狗重置回 NONE 续跑（retries>0），补救机会
+          尚未用尽；
+        - shelved：补救用尽被搁置，不再占用批次容量、不阻塞推进。
+        调用方须持锁。
+        """
+        observing: dict[str, str] = {}
+        remedying: dict[str, str] = {}
+        shelved: dict[str, str] = {}
+        for (did, rid), s in self.store.update_states.items():
+            if rid != r.rollout_id:
+                continue
+            if s.stage == UpdateStage.SHELVED:
+                shelved[did] = s.last_error or "shelved"
+            elif s.stage in (UpdateStage.CONFIRMED, UpdateStage.FAILED,
+                             UpdateStage.ROLLED_BACK):
+                continue
+            elif s.retries > 0:
+                remedying[did] = (
+                    f"retry_{s.retries}_in_progress"
+                    f"(stage={s.stage.value})")
+            elif s.same_stage_reports > 0:
+                observing[did] = (
+                    f"same_stage_repeat x{s.same_stage_reports}"
+                    f"(stage={s.stage.value})")
+        return {"observing": len(observing),
+                "remedying": len(remedying),
+                "shelved": len(shelved),
+                "reasons": {"observing": observing,
+                            "remedying": remedying,
+                            "shelved": shelved}}
 
     # ---------------------------------------------------------------- create
     def create(self, rollout_id: str, fw_id: str, device_ids: list[str],
@@ -249,6 +286,12 @@ class RolloutService:
             state = self.store.update_states.get((device_id, rollout_id))
             if state is not None:
                 # 幂等：断线重连重复认领返回既有任务，不重复计数
+                if state.stage == UpdateStage.SHELVED:
+                    raise BatchStateError(
+                        f"设备 {device_id} 已被搁置，不得重新认领",
+                        details={"reason": "device_shelved",
+                                 "stage": state.stage.value,
+                                 "shelved_reason": state.last_error})
                 if state.stage in _TERMINAL_FOR_BATCH:
                     raise BatchStateError(
                         f"设备 {device_id} 在发布中已是终态 {state.stage.value}",
@@ -307,6 +350,7 @@ class RolloutService:
             state = DeviceUpdateState(
                 device_id=device_id, rollout_id=rollout_id,
                 stage=UpdateStage.NONE, updated_at=now(),
+                stage_entered_at=now(),
                 claimed_by_batch=active.index)
             self.store.update_states[(device_id, rollout_id)] = state
             self.store.persist()

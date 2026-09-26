@@ -32,6 +32,10 @@
   （confirmed/failed/shelved/rolled_back）后，批次置 `done`，开放下一批；
   最后一批收敛完发布 `completed`。已下发但未收敛的设备不会阻塞推进判定
   之外的批次，看门狗负责让它们收敛（重试或搁置）。
+- **收敛保证**：批次只在它名下所有已下发设备都到达可解释终态
+  （**含搁置**）后推进，且只推进一次；单个或少数停滞/掉线设备不会让
+  整批或整次发布永久卡住（见
+  [state-machine.md](state-machine.md) 的“看门狗 / 停滞巡检”一节）。
 
 ## 3. 认领（claim）
 
@@ -43,7 +47,25 @@
 - 容量满 → `batch_full`；
 - **重复认领幂等**：设备已认领但未终态时再次认领（典型为断线重连），
   返回同一任务且 `already_claimed=true`，批次 `claimed` 不重复计数；
-- 已终态设备再认领 → `already_terminal`。
+- 已终态设备再认领 → `already_terminal`；**已搁置设备**再认领 →
+  `device_shelved`（带搁置原因），不得静默回到正常进度。
+
+## 3.1 停滞概览（发布汇总）
+
+`GET /rollouts/{id}` 的响应中带 `stall` 字段，一眼看出停滞处置情况：
+
+```json
+"stall": {"observing": 1, "remedying": 1, "shelved": 2,
+          "reasons": {"observing": {"d3": "same_stage_repeat x5(stage=downloaded)"},
+                      "remedying": {"d4": "retry_1_in_progress(stage=none)"},
+                      "shelved": {"d5": "shelved_after_2_retries(stalled_same_stage)",
+                                  "d6": "shelved_after_2_retries(silent_timeout)"}}}
+```
+
+- `observing`：持续上报同一阶段、仍在停滞观察窗口内的设备数；
+- `remedying`：已被巡检重置续跑、补救机会尚未用尽的设备数；
+- `shelved`：补救用尽被搁置的设备数（不再占用批次容量、不阻塞推进）；
+- `reasons`：每档设备 → 具体原因，便于判断是否需要人工介入。
 
 ## 4. 失败率阈值与自动停止
 
@@ -58,8 +80,7 @@
 
 ## 回滚规则
 
-见 [rollback.md#回滚规则](#回滚规则)（本文件）与
-[state-machine.md](state-machine.md)。
+本节与 [state-machine.md](state-machine.md) 共同描述回滚语义。
 
 - **资格**：仅"已 confirmed 运行在新版本"的设备可回滚；
   downloaded/installed/rebooted 中的半更新设备 →

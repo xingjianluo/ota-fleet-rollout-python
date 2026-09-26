@@ -109,7 +109,12 @@ class Rollout:
 
 @dataclass
 class DeviceUpdateState:
-    """设备在某次发布中的升级进度（按 rollout_id 维度记录）。"""
+    """设备在某次发布中的升级进度（按 rollout_id 维度记录）。
+
+    updated_at 在每次被接受的上报时刷新（“还活着”），
+    stage_entered_at 仅在阶段真正变化时刷新（“在推进”），
+    两者分离使停滞识别不受持续心跳式上报干扰。
+    """
     device_id: str
     rollout_id: str
     stage: UpdateStage = UpdateStage.NONE
@@ -118,6 +123,8 @@ class DeviceUpdateState:
     retries: int = 0
     last_error: str = ""
     claimed_by_batch: int | None = None
+    stage_entered_at: float = 0.0    # 当前阶段的进入时间（进展游标）
+    same_stage_reports: int = 0      # 进入当前阶段后的同阶段重复上报次数
 
 
 @dataclass

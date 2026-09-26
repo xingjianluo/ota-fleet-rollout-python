@@ -16,7 +16,8 @@ class AppContext:
     def __init__(self, data_dir: str = "data", *,
                  heartbeat_ttl: float = 30.0,
                  stage_timeout: float = 60.0,
-                 max_retries: int = 2):
+                 max_retries: int = 2,
+                 stall_window: float = 120.0):
         os.makedirs(data_dir, exist_ok=True)
         self.store = Store(os.path.join(data_dir, "store.json"))
         self.audit = AuditLog(os.path.join(data_dir, "audit.log"))
@@ -29,6 +30,7 @@ class AppContext:
         self.progress = ProgressService(self.store, self.audit,
                                         stage_timeout=stage_timeout,
                                         max_retries=max_retries,
+                                        stall_window=stall_window,
                                         rollouts=self.rollouts,
                                         devices=self.devices)
         self.rollbacks = RollbackService(self.store, self.audit,

@@ -107,6 +107,10 @@ class Store:
                     retries=s.get("retries", 0),
                     last_error=s.get("last_error", ""),
                     claimed_by_batch=s.get("claimed_by_batch"),
+                    # 旧数据没有停滞字段：以 updated_at 兜底，视为刚进入阶段
+                    stage_entered_at=s.get("stage_entered_at",
+                                           s.get("updated_at", 0.0)),
+                    same_stage_reports=s.get("same_stage_reports", 0),
                 )
             for rb in raw.get("rollback_records", []):
                 self.rollback_records.append(RollbackRecord(

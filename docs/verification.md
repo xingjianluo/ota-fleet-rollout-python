@@ -50,6 +50,44 @@ uv run uvicorn main:app --reload
 - reconcile 用权威游标判定落后，返回权威阶段；
 - 4 个阶段请求乱序并发，最终游标为最大 seq，成功最多计一次。
 
+### 5.1 停滞识别与自动续跑 — `tests/test_stall.py`
+- 同阶段重复上报被接受但分类为 `same_stage_repeat`，与推进、幂等重放
+  明确区分；汇总 `stall.observing` 同步可见；
+- **完整链路**：设备反复上报同一阶段（seq 持续增长）→ 超过
+  `stall_window` 被巡检补救（重置续跑）→ 再次停滞 → 补救用尽被搁置
+  → 批次照常收敛、后续批次推进、发布最终 completed；
+- 搁置设备的上报与认领都以 `device_shelved` 明确拒绝，状态不倒退；
+- 重复执行巡检幂等（不重复累加 retries、不重复搁置）；8 线程并发巡检
+  对同一设备补救/搁置恰好一次；50 个并发同阶段上报中重复 seq 不多计；
+- 300 台设备规模：单趟巡检在 5s 内完成，一半恢复一半搁置时整批仍收敛。
+
+本地手动复现（虚拟时钟，无需真实等待）：
+
+```bash
+uv run pytest tests/test_stall.py -q          # 仅停滞相关用例
+uv run python - << 'PY'
+from ota.app import AppContext
+from ota.clock import set_source
+import tempfile
+t = [100.0]; set_source(lambda: t[0])          # 虚拟时钟
+c = AppContext(tempfile.mkdtemp(), stage_timeout=30, max_retries=1,
+               stall_window=60)
+tok = c.devices.register("d1", "A1", "h1", "1.0.0")["token"]
+c.firmwares.create("fw2", "2.0.0", "A1", "h1", ["1.0.0"])
+c.rollouts.create("r1", "fw2", ["d1"], batch_size=1,
+                  failure_rate_threshold=1.0)
+c.rollouts.start("r1")
+c.rollouts.claim("r1", "d1", tok)
+c.progress.report("d1", tok, "r1", "downloaded", 1)
+for seq in range(2, 9):                        # 活着但不推进
+    t[0] += 10
+    print(c.progress.report("d1", tok, "r1", "downloaded", seq)
+          ["classification"])                  # same_stage_repeat
+print(c.progress.watchdog("r1"))               # {'retried': ['d1'], ...}
+print(c.rollouts.summary("r1")["stall"])       # remedying=1
+PY
+```
+
 ### 6. HTTP 归类与完整链路 — `tests/test_api.py`
 - 401/404/409/422 与 code/reason 对应；
 - 注册→固件→发布→并发（演示脚本）→成功/失败→自动停止→回滚→审计
