@@ -6,7 +6,7 @@
 HTTP 层 (api/routes.py)
     │  请求校验(pydantic) → 服务调用 → OTAError 统一转 JSON
     ▼
-服务层 ota/{devices,firmwares,rollouts,progress,rollbacks}.py
+服务层 ota/{devices,firmwares,rollouts,progress,stalls,rollbacks}.py
     │  所有变更操作在 store.lock（threading.RLock）同一把锁内完成
     ▼
 模型/持久化 ota/{models,storage,audit}.py + ota/clock.py

@@ -205,6 +205,16 @@ def watchdog(rollout_id: str, ctx: AppContext = Depends(get_ctx)):
     return ctx.progress.watchdog(rollout_id)
 
 
+@router.post("/rollouts/{rollout_id}/stall-sweep")
+def stall_sweep(rollout_id: str, ctx: AppContext = Depends(get_ctx)):
+    return ctx.progress.stall_sweep(rollout_id)
+
+
+@router.post("/maintenance/stall-sweep")
+def stall_sweep_all(ctx: AppContext = Depends(get_ctx)):
+    return ctx.progress.stall_sweep(None)
+
+
 # -------------------------------------------------------------- rollback
 @router.post("/rollback/device/{device_id}")
 def rollback_device(device_id: str, body: RollbackIn,

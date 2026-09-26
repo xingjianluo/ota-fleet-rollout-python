@@ -31,7 +31,17 @@
 - **批次推进**：当前批次容量全部被认领 **且** 全部设备收敛到终态
   （confirmed/failed/shelved/rolled_back）后，批次置 `done`，开放下一批；
   最后一批收敛完发布 `completed`。已下发但未收敛的设备不会阻塞推进判定
-  之外的批次，看门狗负责让它们收敛（重试或搁置）。
+  之外的批次，看门狗与停滞巡检负责让它们收敛（重试、补救或搁置）。
+  推进只发生一次：重复终态上报、重复巡检、并发触发都不会二次开批。
+
+### 停滞设备的收敛
+
+设备持续在线、持续上报但阶段停在同一步（“假新鲜”）时，由停滞识别层
+处理（规则见 [state-machine.md](state-machine.md#停滞识别与自动续跑stall-sweep)）：
+超过 `stall_window` 标为观察，给有限补救，机会用尽进入 `shelved`。
+搁置设备计入批次失败并视为可解释终态，因此**不会拖死整批或整次发布**；
+`GET /rollouts/{id}` 的 `stall` 块给出 observing/remediating/shelved
+三档计数与每台设备原因，便于判断是否人工介入。
 
 ## 3. 认领（claim）
 
@@ -58,7 +68,7 @@
 
 ## 回滚规则
 
-见 [rollback.md#回滚规则](#回滚规则)（本文件）与
+见 [rollback.md](rollback.md) 与
 [state-machine.md](state-machine.md)。
 
 - **资格**：仅"已 confirmed 运行在新版本"的设备可回滚；

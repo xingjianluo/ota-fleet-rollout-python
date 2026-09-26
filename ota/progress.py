@@ -1,4 +1,4 @@
-"""升级阶段推进、乱序/重放收敛与超时看门狗。
+"""升级阶段推进、乱序/重放收敛、超时看门狗与停滞识别。
 
 阶段链：NONE -> downloaded -> installed -> rebooted -> confirmed
 
@@ -9,6 +9,10 @@
 - seq 跳号                 -> 允许（设备可能合并中间上报），但阶段必须
                               不回退；回退阶段按倒退拒绝；
 - confirmed/failed/...    -> 终态后只接受相同阶段的幂等重放，其余拒绝。
+
+“活着”不等于“在推进”：seq/时间持续更新但阶段停在同一步属于重复上报，
+不移动停滞锚点 stage_entered_at；停滞识别（ota.stalls）依据该锚点判定：
+观察窗口 -> 有限补救 -> 机会用尽 SHELVED。
 
 看门狗：某阶段停留超过 stage_timeout 时，retries < max_retries 将状态
 重置回 NONE 让设备重领（重新下载）；超过则置 SHELVED 搁置。两者都计入
@@ -25,7 +29,7 @@ from .errors import (
     StageTransitionError,
     StaleReportError,
 )
-from .models import RolloutStatus, UpdateStage
+from .models import RolloutStatus, StallState, UpdateStage
 from .storage import Store
 
 log = logging.getLogger("ota.progress")
@@ -37,17 +41,21 @@ _ADVANCE = {
     UpdateStage.REBOOTED: UpdateStage.CONFIRMED,
 }
 
+_TERMINAL_STAGES = (UpdateStage.CONFIRMED, UpdateStage.FAILED,
+                    UpdateStage.ROLLED_BACK, UpdateStage.SHELVED)
+
 
 class ProgressService:
     def __init__(self, store: Store, audit: AuditLog, *,
                  stage_timeout: float = 60.0, max_retries: int = 2,
-                 rollouts=None, devices=None):
+                 rollouts=None, devices=None, stalls=None):
         self.store = store
         self.audit = audit
         self.stage_timeout = stage_timeout
         self.max_retries = max_retries
         self.rollouts = rollouts
         self.devices = devices
+        self.stalls = stalls
 
     def _services(self):
         if self.devices is None:
@@ -57,6 +65,11 @@ class ProgressService:
             from .rollouts import RolloutService
             self.rollouts = RolloutService(self.store, self.audit, None,
                                            self.devices)
+        if self.stalls is None:
+            from .stalls import StallService
+            self.stalls = StallService(self.store, self.audit,
+                                       max_remedies=self.max_retries,
+                                       rollouts=self.rollouts)
         return self.devices, self.rollouts
 
     # --------------------------------------------------------------- report
@@ -86,6 +99,7 @@ class ProgressService:
                              "rollout_id": rollout_id})
 
             old_stage = state.stage
+            ts = now()
             # 1) 乱序/迟到：seq 回退
             if seq < state.stage_seq:
                 self.audit.record("progress_rejected", {
@@ -100,18 +114,25 @@ class ProgressService:
                              "accepted_seq": state.stage_seq})
 
             # 2) 终态保护
-            if old_stage in (UpdateStage.CONFIRMED, UpdateStage.FAILED,
-                             UpdateStage.ROLLED_BACK, UpdateStage.SHELVED):
+            if old_stage in _TERMINAL_STAGES:
                 if seq == state.stage_seq and wanted == old_stage:
-                    return self._view(state, duplicate=True)  # 幂等重放
+                    # 幂等重放：搁置设备也要拿到明确的搁置反馈，不许静默回归
+                    return self._view(
+                        state, duplicate=True,
+                        report_class=("shelved_duplicate"
+                                      if old_stage == UpdateStage.SHELVED
+                                      else "duplicate"))
+                reason = ("shelved_locked"
+                          if old_stage == UpdateStage.SHELVED
+                          else "terminal_stage_locked")
                 self.audit.record("progress_rejected", {
                     "device_id": device_id, "rollout_id": rollout_id,
-                    "reason": "terminal_stage_locked",
+                    "reason": reason,
                     "input_stage": wanted.value, "stage": old_stage.value})
                 raise StageTransitionError(
                     f"设备已处于终态 {old_stage.value}，拒绝迁移到 "
                     f"{wanted.value}",
-                    details={"reason": "terminal_stage_locked",
+                    details={"reason": reason,
                              "stage": old_stage.value,
                              "input_stage": wanted.value})
 
@@ -128,9 +149,11 @@ class ProgressService:
                         f"!= 已记录 {old_stage.value}",
                         details={"reason": "same_seq_conflicting_stage",
                                  "seq": seq})
-                return self._view(state, duplicate=True)
+                # 活着 ≠ 在推进：同阶段重放不移动停滞锚点
+                return self._view(state, duplicate=True,
+                                  report_class="same_stage_duplicate")
 
-            # 4) seq 更新：阶段不得倒退（NONE 仅在看门狗重置后配合新 seq）
+            # 4) seq 更新：阶段不得倒退（NONE 仅在看门狗/停滞重置后配合新 seq）
             if wanted != UpdateStage.FAILED and \
                     wanted not in (UpdateStage.DOWNLOADED,
                                    UpdateStage.INSTALLED,
@@ -140,10 +163,11 @@ class ProgressService:
                     f"设备不可直接上报到 {wanted.value}",
                     details={"reason": "illegal_stage_report",
                              "input_stage": wanted.value})
-            if wanted == UpdateStage.FAILED:
-                state.stage = UpdateStage.FAILED
-            elif self._rank(wanted) < self._rank(old_stage) and \
-                    not (old_stage == UpdateStage.NONE):
+
+            is_failure = wanted == UpdateStage.FAILED
+            advanced = (is_failure or self._rank(wanted) >= self._rank(
+                old_stage))
+            if not advanced:
                 self.audit.record("progress_rejected", {
                     "device_id": device_id, "rollout_id": rollout_id,
                     "reason": "stage_regression",
@@ -152,11 +176,42 @@ class ProgressService:
                     f"阶段倒退被拒绝: {old_stage.value} -> {wanted.value}",
                     details={"reason": "stage_regression",
                              "from": old_stage.value, "to": wanted.value})
-            else:
+
+            stage_changed = wanted != old_stage
+            same_stage_repeat = not is_failure and not stage_changed
+
+            # 5) 停滞识别（只看阶段是否前移，与 seq 新鲜度无关）。
+            #    NONE -> 某阶段：补救后的重新开始或首次进展。
+            report_class = "progress"
+            if is_failure:
+                state.stage = UpdateStage.FAILED
+                state.stall_state = StallState.IDLE
+                state.stall_reason = ""
+            elif old_stage == UpdateStage.NONE:
                 state.stage = wanted
+                if state.retries > 0:
+                    # 看门狗/停滞补救后的重新开始：仍在补救观察期，真正
+                    # 阶段前移后才回到 IDLE
+                    state.stall_state = StallState.REMEDIATING
+                    state.stall_reason = "remedy_resumed"
+                    report_class = "remedy_resumed"
+            elif same_stage_repeat:
+                state.stage = wanted
+                report_class = self._classify_same_stage(
+                    state, ts, self.stalls.stall_window,
+                    audit=self.audit)
+            else:
+                # 真正的阶段前移：清掉停滞簿记，重新开始观察
+                state.stage = wanted
+                state.stall_state = StallState.IDLE
+                state.stall_reason = ""
+                state.stall_since = 0.0
 
             state.stage_seq = seq
-            state.updated_at = now()
+            state.updated_at = ts
+            if stage_changed or is_failure:
+                # 停滞锚点只随“阶段迁移”移动；同阶段重复不移动
+                state.stage_entered_at = ts
             state.last_error = ""
 
             # confirmed：提交设备版本，批次计数
@@ -174,15 +229,20 @@ class ProgressService:
             self.audit.record("stage_transition", {
                 "device_id": device_id, "rollout_id": rollout_id,
                 "from": old_stage.value, "to": state.stage.value,
-                "seq": seq})
+                "seq": seq, "report_class": report_class})
             log.info("progress input=(device=%s rollout=%s seq=%d stage=%s) "
-                     "%s -> %s%s", device_id, rollout_id, seq, wanted.value,
-                     old_stage.value, state.stage.value,
-                     " committed" if committed else "")
+                     "%s -> %s%s [%s]", device_id, rollout_id, seq,
+                     wanted.value, old_stage.value, state.stage.value,
+                     " committed" if committed else "", report_class)
 
             self.store.persist()
-            rollouts.record_outcome(rollout_id, device_id, state.stage)
-            return self._view(state, duplicate=False)
+            if is_failure:
+                rollouts.record_outcome(rollout_id, device_id,
+                                        UpdateStage.FAILED)
+            else:
+                rollouts.record_outcome(rollout_id, device_id, state.stage)
+            return self._view(state, duplicate=False,
+                              report_class=report_class)
 
     def report_failure(self, device_id: str, token: str, rollout_id: str,
                        seq: int, error: str = "") -> dict:
@@ -193,6 +253,20 @@ class ProgressService:
             if state is None:
                 raise RolloutValidationError(
                     "设备尚未认领该发布", details={"reason": "not_claimed"})
+            # 终态保护：搁置/已确认/已回滚的设备不得借失败上报改态，
+            # 已搁置设备尤其不能静默脱离搁置（FAILED 自身允许补充错误信息）
+            if state.stage in _TERMINAL_STAGES \
+                    and state.stage != UpdateStage.FAILED:
+                reason = ("shelved_locked"
+                          if state.stage == UpdateStage.SHELVED
+                          else "terminal_stage_locked")
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": reason, "stage": state.stage.value,
+                    "input": "failure"})
+                raise StageTransitionError(
+                    f"设备已处于终态 {state.stage.value}，拒绝失败上报",
+                    details={"reason": reason, "stage": state.stage.value})
             if seq <= state.stage_seq and state.stage != UpdateStage.FAILED:
                 raise StaleReportError(
                     "失败上报 seq 已过期", details={"reason": "seq_regression"})
@@ -200,6 +274,8 @@ class ProgressService:
             state.stage_seq = max(seq, state.stage_seq)
             state.updated_at = now()
             state.last_error = error or "device_reported_failure"
+            state.stall_state = StallState.IDLE
+            state.stall_reason = ""
             self.store.persist()
             self.audit.record("device_failed", {
                 "device_id": device_id, "rollout_id": rollout_id,
@@ -228,10 +304,7 @@ class ProgressService:
                 for state in list(self.store.update_states.values()):
                     if state.rollout_id != r.rollout_id:
                         continue
-                    if state.stage in (UpdateStage.CONFIRMED,
-                                       UpdateStage.FAILED,
-                                       UpdateStage.ROLLED_BACK,
-                                       UpdateStage.SHELVED):
+                    if state.stage in _TERMINAL_STAGES:
                         continue
                     # NONE 表示设备刚认领、仍在正常下载准备窗口内，
                     # 只有看门狗重试后回到 NONE（retries>0）才继续监控
@@ -242,32 +315,27 @@ class ProgressService:
                         continue
                     stuck_for = ts - state.updated_at
                     if state.retries < self.max_retries:
-                        state.retries += 1
-                        prev = state.stage
-                        state.stage = UpdateStage.NONE
-                        state.updated_at = ts
+                        prev_stage = state.stage
+                        # 与停滞巡检共享补救预算与簿记：重置回 NONE 只发生一次
+                        self.stalls._reset_to_none(
+                            state, ts, reason="watchdog_timeout_remedy",
+                            audit=self.audit,
+                            detail_extra={"stuck_seconds": stuck_for,
+                                          "kind": "watchdog_retry",
+                                          "from_stage": prev_stage.value})
                         retried.append(state.device_id)
-                        self.audit.record("watchdog_retry", {
-                            "device_id": state.device_id,
-                            "rollout_id": r.rollout_id,
-                            "from_stage": prev.value,
-                            "retries": state.retries,
-                            "stuck_seconds": stuck_for})
                         log.warning("watchdog retry device=%s stage=%s "
                                     "stuck=%.0fs retries=%d",
-                                    state.device_id, prev.value, stuck_for,
-                                    state.retries)
+                                    state.device_id, prev_stage.value,
+                                    stuck_for, state.retries)
                     else:
-                        state.stage = UpdateStage.SHELVED
-                        state.updated_at = ts
-                        state.last_error = (
-                            f"shelved_after_{state.retries}_retries")
+                        self.stalls._shelve(
+                            state, ts,
+                            reason=f"shelved_after_{state.retries}_retries",
+                            audit=self.audit,
+                            detail_extra={"stuck_seconds": stuck_for,
+                                          "kind": "watchdog_shelved"})
                         shelved.append(state.device_id)
-                        self.audit.record("watchdog_shelved", {
-                            "device_id": state.device_id,
-                            "rollout_id": r.rollout_id,
-                            "retries": state.retries,
-                            "stuck_seconds": stuck_for})
                         log.error("watchdog shelve device=%s retries=%d "
                                   "stuck=%.0fs", state.device_id,
                                   state.retries, stuck_for)
@@ -307,6 +375,42 @@ class ProgressService:
                      state.stage_seq, state.stage.value, behind)
             return view
 
+    # ------------------------------------------------------------- sweeps
+    def stall_sweep(self, rollout_id: str | None = None) -> dict:
+        """停滞巡检（代理到 StallService）；重复/并发调用幂等。"""
+        self._services()
+        return self.stalls.sweep(rollout_id)
+
+    # ------------------------------------------------------------ classify
+    def _classify_same_stage(self, state, ts: float, window: float,
+                             audit=None) -> str:
+        """seq 更新但阶段相同（设备活着但没有推进）的反馈分类。
+
+        调用方须持锁。返回：
+        - ``same_stage_within_window``：仍在观察窗口内；
+        - ``same_stage_observing``：已过观察窗口、尚在补救窗口内；
+        - ``same_stage_remedying``：给过补救机会后仍未推进；
+        IDLE 且已过窗口时惰性转入 OBSERVING（与 sweep 判定一致）。
+        """
+        if state.stall_state == StallState.IDLE:
+            if ts - state.stage_entered_at > window:
+                state.stall_state = StallState.OBSERVING
+                state.stall_since = ts
+                state.stall_reason = "stalled_no_progress"
+                if audit is not None:
+                    audit.record("stall_observed", {
+                        "device_id": state.device_id,
+                        "rollout_id": state.rollout_id,
+                        "stage": state.stage.value,
+                        "stuck_seconds": ts - state.stage_entered_at,
+                        "window": window,
+                        "trigger": "same_stage_report"})
+                return "same_stage_observing"
+            return "same_stage_within_window"
+        if state.stall_state == StallState.OBSERVING:
+            return "same_stage_observing"
+        return "same_stage_remedying"
+
     # --------------------------------------------------------------- utils
     @staticmethod
     def _rank(stage: UpdateStage) -> int:
@@ -315,10 +419,14 @@ class ProgressService:
                  UpdateStage.CONFIRMED]
         return order.index(stage)
 
-    def _view(self, state, *, duplicate: bool) -> dict:
+    def _view(self, state, *, duplicate: bool,
+              report_class: str = "progress") -> dict:
         return {"device_id": state.device_id,
                 "rollout_id": state.rollout_id,
                 "stage": state.stage.value, "seq": state.stage_seq,
                 "retries": state.retries,
                 "server_ts": state.updated_at,
-                "duplicate": duplicate}
+                "duplicate": duplicate,
+                "report_class": report_class,
+                "stall_state": state.stall_state.value,
+                "stall_reason": state.stall_reason}

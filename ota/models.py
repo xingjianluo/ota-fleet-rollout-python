@@ -56,6 +56,19 @@ class BatchStatus(str, Enum):
     DONE = "done"
 
 
+class StallState(str, Enum):
+    """停滞识别生命周期（与“设备活着”相互独立的一层判定）。
+
+    IDLE        尚未发现停滞（正常推进或仍在观察窗口内）；
+    OBSERVING   同阶段持续无进展已超过停滞观察窗口，尚未补救；
+    REMEDIATING 已给过至少一次补救机会，等待设备重新推进；
+                机会用尽仍无进展则由 stage=SHELVED 体现终态。
+    """
+    IDLE = "idle"
+    OBSERVING = "observing"
+    REMEDIATING = "remediating"
+
+
 @dataclass
 class Device:
     device_id: str
@@ -114,10 +127,15 @@ class DeviceUpdateState:
     rollout_id: str
     stage: UpdateStage = UpdateStage.NONE
     stage_seq: int = 0           # 设备侧上报序号，用于乱序/重放判定
-    updated_at: float = 0.0
-    retries: int = 0
+    updated_at: float = 0.0      # 最近一次被接受的上报时间（看门狗锚点）
+    retries: int = 0             # 补救预算（看门狗与停滞巡检共享）
     last_error: str = ""
     claimed_by_batch: int | None = None
+    # ---- 停滞识别：以“阶段是否前移”为准，与 seq/时间是否更新无关 ----
+    stage_entered_at: float = 0.0   # 进入当前阶段的时间（停滞判定锚点）
+    stall_state: StallState = StallState.IDLE
+    stall_since: float = 0.0        # 最近一次被判停滞（observing）的时间
+    stall_reason: str = ""          # 机器可读原因，如 stalled_no_progress
 
 
 @dataclass

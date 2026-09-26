@@ -6,8 +6,9 @@
 2. 固件不兼容（型号、降级、白名单）拒绝；
 3. 两批灰度，第二批并发认领不超容量；
 4. 乱序/重复上报收敛，看门狗重试；
-5. 失败率阈值自动停止；
-6. 单设备回滚 + 回滚重复拒绝 + 幂等重放。
+5. 停滞识别：设备活着但同阶段反复上报 -> 观察 -> 补救 -> 续跑成功；
+6. 失败率阈值自动停止；
+7. 单设备回滚 + 回滚重复拒绝 + 幂等重放。
 """
 from __future__ import annotations
 
@@ -50,7 +51,8 @@ def main():
     print(f"数据目录: {tmp}")
     clock = Clock()
     set_source(clock)
-    ctx = AppContext(tmp, heartbeat_ttl=10, stage_timeout=30, max_retries=1)
+    ctx = AppContext(tmp, heartbeat_ttl=10, stage_timeout=30, max_retries=1,
+                     stall_window=20, remedy_grace=10)
 
     print("\n== 1. 设备注册与身份/心跳防护 ==")
     tokens = {}
@@ -121,10 +123,28 @@ def main():
     clock.tick(31)
     print("  watchdog:", ctx.progress.watchdog("rel-1"))
 
-    print("\n== 7. d2/d3 失败 -> 失败率阈值触发自动停止 ==")
+    print("\n== 6b. d2 “活着但停滞” -> 观察 -> 补救 -> 自动续跑成功 ==")
     ctx.progress.report("d2", tokens["d2"], "rel-1", "downloaded", 1)
-    ctx.progress.report_failure("d2", tokens["d2"], "rel-1", 2,
-                                "checksum")
+    # seq 持续增长、时间持续更新，但阶段停在 downloaded
+    clock.tick(5)
+    v = ctx.progress.report("d2", tokens["d2"], "rel-1", "downloaded", 2)
+    print(f"  窗口内同阶段新鲜上报: {v['report_class']}")
+    clock.tick(16)  # 超过 stall_window=20
+    v = ctx.progress.report("d2", tokens["d2"], "rel-1", "downloaded", 3)
+    print(f"  过窗口同阶段新鲜上报: {v['report_class']}（活着≠在推进）")
+    print("  stall-sweep:", ctx.progress.stall_sweep("rel-1"))  # 仅观察
+    clock.tick(11)  # 过 remedy_grace=10
+    print("  stall-sweep:", ctx.progress.stall_sweep("rel-1"))  # 补救回 NONE
+    print("  重复巡检幂等:", ctx.progress.stall_sweep("rel-1"))
+    # 设备获得补救后重新下载并一路推进到 confirmed
+    for seq, stage in [(4, "downloaded"), (5, "installed"),
+                       (6, "rebooted"), (7, "confirmed")]:
+        v = ctx.progress.report("d2", tokens["d2"], "rel-1", stage, seq)
+    print(f"  d2 续跑后固件: {ctx.store.devices['d2'].fw_version} "
+          f"(分类 {v['report_class']} -> 推进即清停滞)")
+    print("  停滞汇总:", ctx.rollouts.summary("rel-1")["stall"])
+
+    print("\n== 7. d3 失败（叠加 d1 搁置）-> 失败率阈值自动停止 ==")
     ctx.progress.report("d3", tokens["d3"], "rel-1", "downloaded", 1)
     ctx.progress.report_failure("d3", tokens["d3"], "rel-1", 2, "power")
     r = ctx.store.rollouts["rel-1"]

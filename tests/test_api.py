@@ -176,3 +176,55 @@ def test_watchdog_and_reconcile_http(client):
     assert rr.json()["stage"] == "none"
     assert rr.json()["client_is_behind"] is True
     assert rr.json()["accepted_seq"] == 1
+
+
+def test_stall_sweep_over_http(tmp_path):
+    """HTTP：停滞巡检端点可用，搁置后推进返回 422 shelved_locked。"""
+    clock = FakeClock()
+    set_source(clock)
+    ctx = AppContext(str(tmp_path), heartbeat_ttl=10.0, stage_timeout=300.0,
+                     max_retries=1, stall_window=10.0, remedy_grace=5.0)
+    routes.set_ctx(ctx)
+    c = TestClient(app)
+    try:
+        token = register(c, "d1")
+        make_firmwares(c)
+        r = c.post("/rollouts", json={"rollout_id": "r1", "fw_id": "fw2",
+                                      "device_ids": ["d1"], "batch_size": 1,
+                                      "failure_rate_threshold": 0.5})
+        assert r.status_code == 200
+        c.post("/rollouts/r1/start")
+        c.post("/rollouts/r1/claim/d1", json={"token": token})
+        r = c.post("/rollouts/r1/report/d1",
+                   json={"token": token, "seq": 1, "stage": "downloaded"})
+        assert r.status_code == 200
+        assert r.json()["report_class"] == "progress"
+
+        # 窗口内同阶段新鲜上报 -> same_stage_within_window
+        clock.t += 5
+        r = c.post("/rollouts/r1/report/d1",
+                   json={"token": token, "seq": 2, "stage": "downloaded"})
+        assert r.json()["report_class"] == "same_stage_within_window"
+
+        # 过观察窗口 -> observing；巡检端点补救 -> 再观察窗口 -> 搁置
+        clock.t += 6
+        r = c.post("/rollouts/r1/report/d1",
+                   json={"token": token, "seq": 3, "stage": "downloaded"})
+        assert r.json()["report_class"] == "same_stage_observing"
+        clock.t += 6
+        r = c.post("/rollouts/r1/stall-sweep")
+        assert r.status_code == 200 and r.json()["remedied"] == ["d1"]
+        clock.t += 11
+        r = c.post("/maintenance/stall-sweep")
+        assert r.json()["shelved"] == ["d1"]
+
+        # 搁置后推进 -> 422 shelved_locked；汇总带 stall 计数
+        r = c.post("/rollouts/r1/report/d1",
+                   json={"token": token, "seq": 4, "stage": "installed"})
+        assert r.status_code == 422
+        assert r.json()["details"]["reason"] == "shelved_locked"
+        r = c.get("/rollouts/r1")
+        assert r.json()["stall"]["shelved"]["count"] == 1
+    finally:
+        routes.set_ctx(None)
+        reset()

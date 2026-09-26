@@ -42,11 +42,12 @@ _TERMINAL_FOR_BATCH = {
 
 class RolloutService:
     def __init__(self, store: Store, audit: AuditLog,
-                 firmwares: FirmwareService, devices=None):
+                 firmwares: FirmwareService, devices=None, stalls=None):
         self.store = store
         self.audit = audit
         self.firmwares = firmwares
         self.devices = devices
+        self.stalls = stalls
 
     # -------------------------------------------------------------- helpers
     def _get(self, rollout_id: str) -> Rollout:
@@ -77,10 +78,14 @@ class RolloutService:
                             "claimed": len(b.claimed),
                             "succeeded": len(b.succeeded),
                             "failed": len(b.failed)})
-        return {"rollout_id": r.rollout_id, "fw_id": r.fw_id,
-                "target_version": r.target_version,
-                "status": r.status.value, "batches": batches,
-                "halted_reason": r.halted_reason}
+        summary = {"rollout_id": r.rollout_id, "fw_id": r.fw_id,
+                   "target_version": r.target_version,
+                   "status": r.status.value, "batches": batches,
+                   "halted_reason": r.halted_reason}
+        stalls = getattr(self, "stalls", None)
+        if stalls is not None:
+            summary["stall"] = stalls._stall_summary_locked(r.rollout_id)
+        return summary
 
     # ---------------------------------------------------------------- create
     def create(self, rollout_id: str, fw_id: str, device_ids: list[str],
@@ -307,6 +312,7 @@ class RolloutService:
             state = DeviceUpdateState(
                 device_id=device_id, rollout_id=rollout_id,
                 stage=UpdateStage.NONE, updated_at=now(),
+                stage_entered_at=now(),
                 claimed_by_batch=active.index)
             self.store.update_states[(device_id, rollout_id)] = state
             self.store.persist()

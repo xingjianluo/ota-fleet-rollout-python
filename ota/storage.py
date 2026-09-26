@@ -13,6 +13,7 @@ import threading
 from dataclasses import asdict
 
 from .models import (
+    BatchStatus,
     Device,
     DevicePresence,
     DeviceUpdateState,
@@ -20,8 +21,8 @@ from .models import (
     RollbackRecord,
     Rollout,
     RolloutBatch,
-    BatchStatus,
     RolloutStatus,
+    StallState,
     UpdateStage,
 )
 
@@ -107,6 +108,12 @@ class Store:
                     retries=s.get("retries", 0),
                     last_error=s.get("last_error", ""),
                     claimed_by_batch=s.get("claimed_by_batch"),
+                    stage_entered_at=s.get(
+                        "stage_entered_at", s.get("updated_at", 0.0)),
+                    stall_state=_e(StallState,
+                                   s.get("stall_state", "idle")),
+                    stall_since=s.get("stall_since", 0.0),
+                    stall_reason=s.get("stall_reason", ""),
                 )
             for rb in raw.get("rollback_records", []):
                 self.rollback_records.append(RollbackRecord(

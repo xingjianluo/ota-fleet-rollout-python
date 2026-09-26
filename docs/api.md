@@ -50,7 +50,7 @@
 | `rollout_validation_failed` | 422 | `incompatible_members`（带每台设备原因）、`no_devices`、`bad_batch_size`、`bad_threshold`、`unknown_rollout` |
 | `rollout_state_conflict` | 409 | `not_pending` / `not_in_progress` / `not_resumable` |
 | `batch_state_conflict` | 409 | `not_current_batch` / `batch_full` / `rollout_paused` / `rollout_auto_halted` / `already_terminal` / `no_active_batch` |
-| `stage_transition_rejected` | 422 | `terminal_stage_locked` / `stage_regression` / `same_seq_conflicting_stage` / `unknown_stage` |
+| `stage_transition_rejected` | 422 | `terminal_stage_locked` / `shelved_locked` / `stage_regression` / `same_seq_conflicting_stage` / `unknown_stage` |
 | `stale_report_rejected` | 409 | `seq_regression` |
 | `rollback_rejected` | 422 | `device_mid_update_not_rollbackable` / `already_on_target_version` / `target_newer_than_current` / `batch_precheck_blocked` / `missing_idem_key` / `bad_batch_index` / `empty_batch_no_devices` |
 | `rollback_duplicate` | 409 | `already_rolled_back_to_target` |
