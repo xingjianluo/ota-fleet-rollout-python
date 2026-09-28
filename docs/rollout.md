@@ -50,6 +50,20 @@
 - 已终态设备再认领 → `already_terminal`；**已搁置设备**再认领 →
   `device_shelved`（带搁置原因），不得静默回到正常进度。
 
+### 已定局设备的后续上报
+
+设备一旦定局（confirmed / failed / rolled_back / shelved），之后再收到
+任何形式的上报（带阶段或只报失败、编号是否更大）都不会改写结论：
+
+- shelved 设备的失败上报 → 422 `device_shelved`，搁置原因与
+  `stall.shelved` 汇总保留；
+- confirmed / rolled_back 的失败上报 → 422 `terminal_stage_locked`；
+- failed 重发相同 seq 的同一条失败 → 幂等 `duplicate=true`，不重复计数；
+  更大 seq 的新失败 → 422 `terminal_stage_locked`。
+
+被拒绝的上报不计入成功/失败、不刷新游标，因此不占用批次容量、不触发
+失败率阈值、也不会让已经推进的批次状态回退。
+
 ## 3.1 停滞概览（发布汇总）
 
 `GET /rollouts/{id}` 的响应中带 `stall` 字段，一眼看出停滞处置情况：

@@ -15,6 +15,15 @@
 - shelved                 -> 一律以 device_shelved 拒绝，不得静默回到
                               正常进度。
 
+只报失败（不带 stage）的上报与普通进度上报共用同一套定局保护：
+- shelved 设备再来失败上报      -> device_shelved 拒绝（搁置原因保留）；
+- confirmed/rolled_back/failed -> 仅 FAILED+相同 seq 视为同一条内容
+                                   幂等重放，其余以 terminal_stage_locked
+                                   拒绝；已定局结论不会被覆盖；
+- 非终态 seq 回退              -> seq_regression 拒绝。
+被拒绝的上报不改状态、不刷新游标、不调 record_outcome，因此批次容量、
+汇总计数与后续批次推进都不受影响。
+
 “活着”与“在推进”分离：updated_at 随每次接受的上报刷新，
 stage_entered_at 只在阶段真正变化时刷新。看门狗据此识别两类停滞：
 - silent_timeout      ：长期没有任何上报（updated_at 超时）；
@@ -230,14 +239,71 @@ class ProgressService:
                        seq: int, error: str = "") -> dict:
         devices, _ = self._services()
         with self.store.lock:
+            self.store.ensure_loaded()
             devices.authenticate(device_id, token)
             state = self.store.update_states.get((device_id, rollout_id))
             if state is None:
                 raise RolloutValidationError(
                     "设备尚未认领该发布", details={"reason": "not_claimed"})
-            if seq <= state.stage_seq and state.stage != UpdateStage.FAILED:
+            old_stage = state.stage
+            # 0) 搁置设备：任何失败上报都明确拒绝。搁置是已定局结论，
+            #    不得被后来（哪怕 seq 更新）的失败上报覆盖成 FAILED。
+            if old_stage == UpdateStage.SHELVED:
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "device_shelved", "input_seq": seq,
+                    "input_stage": UpdateStage.FAILED.value,
+                    "stage": old_stage.value})
+                raise StageTransitionError(
+                    f"设备已被搁置（{state.last_error or 'shelved'}），"
+                    f"拒绝失败上报",
+                    details={"reason": "device_shelved",
+                             "stage": old_stage.value,
+                             "shelved_reason": state.last_error,
+                             "input_seq": seq})
+            # 1) seq 回退：过期/重放旧包，拒绝且不改变状态（不重复计数）
+            if seq < state.stage_seq:
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "seq_regression", "input_seq": seq,
+                    "accepted_seq": state.stage_seq,
+                    "input_stage": UpdateStage.FAILED.value,
+                    "stage": old_stage.value})
                 raise StaleReportError(
-                    "失败上报 seq 已过期", details={"reason": "seq_regression"})
+                    f"过期失败上报被拒绝: seq {seq} < 已接受 "
+                    f"{state.stage_seq}",
+                    details={"reason": "seq_regression", "input_seq": seq,
+                             "accepted_seq": state.stage_seq})
+            # 2) 其他已定局终态：只接受“同一条失败”（FAILED + 相同 seq）
+            #    的幂等重放；其余失败上报一律拒绝，定局不可被改写。
+            if old_stage in (UpdateStage.CONFIRMED, UpdateStage.FAILED,
+                             UpdateStage.ROLLED_BACK):
+                if old_stage == UpdateStage.FAILED \
+                        and seq == state.stage_seq:
+                    return self._view(state, duplicate=True)
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "terminal_stage_locked", "input_seq": seq,
+                    "input_stage": UpdateStage.FAILED.value,
+                    "stage": old_stage.value})
+                raise StageTransitionError(
+                    f"设备已处于终态 {old_stage.value}，拒绝失败上报",
+                    details={"reason": "terminal_stage_locked",
+                             "stage": old_stage.value,
+                             "input_stage": UpdateStage.FAILED.value,
+                             "input_seq": seq})
+            # 3) 非终态下 seq 未严格增大：不是新结果，按过期拒绝
+            if seq == state.stage_seq:
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "seq_regression", "input_seq": seq,
+                    "accepted_seq": state.stage_seq,
+                    "input_stage": UpdateStage.FAILED.value,
+                    "stage": old_stage.value})
+                raise StaleReportError(
+                    "失败上报 seq 已过期",
+                    details={"reason": "seq_regression", "input_seq": seq,
+                             "accepted_seq": state.stage_seq})
             state.stage = UpdateStage.FAILED
             state.stage_seq = max(seq, state.stage_seq)
             state.updated_at = now()

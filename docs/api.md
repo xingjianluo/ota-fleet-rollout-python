@@ -21,6 +21,10 @@
 | POST | `/rollouts/{id}/report/{device_id}` | 阶段上报；不带 `stage` 视为失败上报 |
 | POST | `/rollouts/{id}/reconcile/{device_id}` | 重连对账 |
 | POST | `/rollouts/{id}/watchdog` | 触发一次看门狗/停滞巡检（幂等） |
+| POST | `/rollback/device/{id}` | 单设备回滚 |
+| POST | `/rollouts/{id}/rollback-batch/{index}` | 整批回滚（全有或全无） |
+| GET | `/rollback/records` | 回滚批准/拒绝追溯 |
+| GET | `/audit?limit=N` | 审计事件 |
 
 ### 上报响应的判定分类
 
@@ -30,10 +34,27 @@
 |---|---|
 | `advanced` | 阶段真正推进（进展游标重置） |
 | `same_stage_repeat` | 同一阶段的新 seq 重复上报：设备活着但未推进，计入停滞观察（`same_stage_reports` 同步返回） |
-| `duplicate` | 同 seq 同阶段的幂等重放（`duplicate=true`），不重复计数 |
-| `failed` | 失败上报被接受，设备进入 FAILED |
+| `duplicate` | 同 seq 同阶段的幂等重放（`duplicate=true`），不重复计数；已定局 FAILED 重发同一条失败（相同 seq）也走此分支 |
+| `failed` | 失败上报被接受，设备进入 FAILED（仅非终态、seq 严格增大时） |
 
 过期/矛盾/倒退/终态/搁置的上报按错误表拒绝（见下），不会笼统算成功。
+
+### 已定局设备的后续上报（终态保护）
+
+设备一旦进入定局（`confirmed / failed / rolled_back / shelved`），
+之后无论再收到**哪种形式**的上报（带阶段或只报失败、编号是否更大），
+都不会改变已定局结论，也不会改动发布汇总与批次计数：
+
+| 当前定局 | 后续上报 | 结果 |
+|---|---|---|
+| `shelved` | 任意进度上报 / 任意失败上报 / 重新认领 | 拒绝：上报 422 `device_shelved`（带 `shelved_reason`），认领 409 `device_shelved`；搁置原因与 `stall.shelved` 汇总保留 |
+| `confirmed` / `rolled_back` | 任意失败上报（任何 seq） | 拒绝 422 `terminal_stage_locked` |
+| `failed` | 相同 seq 的同一条失败重发 | 幂等 `duplicate=true`，不重复计数 |
+| `failed` | 更大 seq 的新失败、或其他阶段上报 | 拒绝 422 `terminal_stage_locked` |
+| 任意终态 | 相同阶段 + 相同 seq 的重放 | 幂等返回当前权威状态 |
+
+被拒绝的上报不改状态、不刷新 `updated_at/stage_seq`、不重复计入
+批次成功/失败，因此不会占用批次容量，也不会影响后续批次推进。
 
 ### 发布汇总中的停滞概览
 
@@ -42,10 +63,6 @@
 `shelved`（补救用尽已搁置）三档计数，`reasons` 给出每档每台设备的
 具体原因。判定规则详见
 [state-machine.md](state-machine.md)。
-| POST | `/rollback/device/{id}` | 单设备回滚 |
-| POST | `/rollouts/{id}/rollback-batch/{index}` | 整批回滚（全有或全无） |
-| GET | `/rollback/records` | 回滚批准/拒绝追溯 |
-| GET | `/audit?limit=N` | 审计事件 |
 
 错误响应统一为：
 

@@ -88,6 +88,59 @@ print(c.rollouts.summary("r1")["stall"])       # remedying=1
 PY
 ```
 
+### 5.2 已定局设备的后续上报保护 — `tests/test_terminal_protection.py`
+- 搁置设备再发编号更大的“只报失败、不带阶段”上报 → 422
+  `device_shelved`（带搁置原因），状态、搁置原因、`stage_seq`、批次计数
+  与 `stall.shelved` 汇总全部不变，且不产生 `device_failed` 审计；
+- confirmed / rolled_back 设备再报失败 → 422 `terminal_stage_locked`，
+  已提交版本与成功/回滚计数保留；
+- 已定局 FAILED 重发同一条失败（相同 seq）→ 幂等 `duplicate=true`，
+  `device_failed` 审计与批次失败只落一次；更大 seq 的新失败被拒；
+- 非终态失败上报 seq 回退/重复仍按 `seq_regression` 拒绝；
+- 被拒上报不占用批次容量：搁置触发自动停止后 resume，同批其他设备收敛、
+  批次照常推进，被拒上报不改变任一槽位；
+- 15 线程失败上报与停滞巡检 Barrier 并发竞争同一台设备：最终仅 FAILED 或
+  SHELVED 一种定局、恰好计一次；多设备（确认/搁置/失败）并发下批次只
+  收敛推进一次、汇总计数稳定；搁置设备 20 个并发失败上报全部被拒；
+- HTTP 端到端：搁置后不带 `stage` 的失败上报返回 422，汇总搁置数不消失。
+
+本地手动复现（虚拟时钟，无需真实等待）：
+
+```bash
+uv run pytest tests/test_terminal_protection.py -q          # 仅定局保护用例
+uv run python - << 'PY'
+from ota.app import AppContext
+from ota.clock import set_source
+from ota.errors import StageTransitionError
+import tempfile
+t = [100.0]; set_source(lambda: t[0])
+c = AppContext(tempfile.mkdtemp(), stage_timeout=30, max_retries=1,
+               stall_window=60)
+tok = c.devices.register("d1", "A1", "h1", "1.0.0")["token"]
+c.firmwares.create("fw2", "2.0.0", "A1", "h1", ["1.0.0"])
+c.rollouts.create("r1", "fw2", ["d1"], batch_size=1,
+                  failure_rate_threshold=1.0)
+c.rollouts.start("r1")
+c.rollouts.claim("r1", "d1", tok)
+# 停滞 -> 补救 -> 再停滞 -> 搁置
+for seq in range(1, 9):
+    t[0] += 10
+    c.progress.report("d1", tok, "r1", "downloaded", seq)
+print(c.progress.watchdog("r1"))                  # retried=['d1']
+for seq in range(20, 28):
+    t[0] += 10
+    c.progress.report("d1", tok, "r1", "downloaded", seq)
+print(c.progress.watchdog("r1"))                  # shelved=['d1']
+print(c.rollouts.summary("r1")["stall"]["shelved"])   # 1
+# 设备再发一条只报失败、编号更大的上报：应被拒绝，定局保持不变
+try:
+    c.progress.report_failure("d1", tok, "r1", 999, "late failure")
+except StageTransitionError as e:
+    print("rejected:", e.details["reason"])       # device_shelved
+print(c.rollouts.summary("r1")["stall"]["shelved"])   # 仍是 1
+PY
+```
+
 ### 6. HTTP 归类与完整链路 — `tests/test_api.py`
 - 401/404/409/422 与 code/reason 对应；
 - 注册→固件→发布→并发（演示脚本）→成功/失败→自动停止→回滚→审计
