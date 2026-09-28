@@ -9,7 +9,7 @@
 
 ```bash
 uv sync
-uv run pytest -q            # 54 个用例（异常链路为主）
+uv run pytest -q            # 61 个用例（异常链路与并发定局保护为主）
 uv run python scripts/demo.py   # 端到端场景演示，打印状态迁移依据
 uv run uvicorn main:app --reload  # 启动 HTTP 服务（可选，交互见 /docs）
 ```

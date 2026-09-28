@@ -31,14 +31,22 @@ NONE ─────────► NONE ──────────► DOWNL
     回滚（confirmed 之后）  → ROLLED_BACK
 ```
 
-终态：`CONFIRMED / FAILED / ROLLED_BACK / SHELVED`。进入终态后：
+终态：`CONFIRMED / FAILED / ROLLED_BACK / SHELVED`。**一旦定局，之后
+收到任何形式的上报（带阶段的普通上报，或不带 `stage` 的纯失败上报）
+都不会再改变设备状态、版本与批次/停滞汇总计数**，具体分两档：
 
 - `CONFIRMED / FAILED / ROLLED_BACK`：相同阶段 + 相同 seq 的重放 →
-  幂等返回当前权威状态；其他任何推进尝试 → 422 `terminal_stage_locked`，
-  状态不倒退；
-- `SHELVED`：**任何**进度上报与认领都明确拒绝（上报 → 422
-  `device_shelved`，认领 → 409 `device_shelved`），被搁置的设备不得
-  静默回到正常进度。
+  幂等返回当前权威状态（FAILED 设备重发同一条失败上报同样幂等，
+  `duplicate=true`，不重复计数、不重复写审计）；其他任何上报（含
+  seq 更大的新失败上报、向任何阶段的迁移）→ 422
+  `terminal_stage_locked`，状态、已提交版本、失败原因都不倒退；
+- `SHELVED`：**任何**进度上报与认领都明确拒绝（普通上报 → 422
+  `device_shelved`，纯失败上报 → 422 `device_shelved`，认领 → 409
+  `device_shelved`）。已记录的搁置结论（`last_error` 中的补救次数与
+  停滞原因、汇总 `stall.shelved` 计数与原因）不会被后来的上报覆盖。
+- 被拒绝的上报**不占用批次容量、不改变成功/失败计数、不触发阈值、
+  不推进也不阻塞后续批次**；每次拒绝都写 `progress_rejected` 审计，
+  失败上报路径带 `via=failure_report` 以便追溯。
 
 ## 进展与停滞的判定（“活着”≠“在推进”）
 
@@ -71,10 +79,10 @@ NONE ─────────► NONE ──────────► DOWNL
 | seq 回退（迟到/重放旧包） | 409 | `seq_regression` | 过期上报，状态不变 |
 | 同 seq、阶段不同 | 422 | `same_seq_conflicting_stage` | 矛盾包 |
 | seq 更新但阶段倒退 | 422 | `stage_regression` | 拒绝 |
-| 已搁置设备的任何上报 | 422 | `device_shelved` | 不得静默回到正常进度 |
-| 其他终态的推进尝试 | 422 | `terminal_stage_locked` | 拒绝 |
+| 已搁置设备的任何上报（含纯失败上报） | 422 | `device_shelved` | 不得静默回到正常进度，搁置结论不被覆盖 |
+| 其他终态后再迁移/再报失败 | 422 | `terminal_stage_locked` | 拒绝；FAILED 同 seq 重发仍幂等 |
 | 设备未认领就上报 | 422 | `not_claimed` | 拒绝 |
-| 报告失败（stage 省略） | 200 | `classification=failed` | 进入 FAILED |
+| 报告失败（stage 省略） | 200 | `classification=failed` | 进入 FAILED（仅非终态设备可接受） |
 
 ## 断线重连增量补齐（reconcile）
 
@@ -114,9 +122,14 @@ NONE ─────────► NONE ──────────► DOWNL
 2. **游标**：`stage_seq` 只在锁内比较与赋值，乱序并发后游标必为最大值，
    阶段不会倒退；`same_stage_reports` 只在锁内对“新 seq 同阶段”上报
    +1，并发重复上报不会多计或漏计。
-3. **巡检**：补救/搁置的状态迁移与时间游标刷新在同一临界区，并发或
-   重复巡检对同一设备恰好生效一次。
+3. **巡检与上报竞态**：补救/搁置的状态迁移与时间游标刷新在同一临界区；
+   失败上报在写入前会用与巡检**完全相同**的停滞判定检查设备，若补救
+   机会已用尽且停滞条件已成立，则先让搁置落定、再以 `device_shelved`
+   拒绝失败上报。因此失败上报与巡检并发（无论谁先拿到锁），设备最终
+   都是 SHELVED 且搁置事件、批次计数恰好一次，不会出现“先搁置又被
+   改成失败”或汇总数字来回跳。
 4. **回滚**：资格检查与生效在同一临界区；已回滚标记（completed 记录）
    在锁内可见，第二个并发请求只能得到 `rollback_duplicate`。
 5. **批次**：预分区 + 锁内容量检查，并发认领结果为恰好 capacity 台成功；
-   批次只在全部已下发设备到达终态（含搁置）后推进一次。
+   批次只在全部已下发设备到达终态（含搁置）后推进一次；被拒绝的上报
+   不调用结果计数，因此不占容量、不影响推进。

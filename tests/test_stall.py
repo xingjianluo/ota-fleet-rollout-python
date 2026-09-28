@@ -205,7 +205,13 @@ def test_concurrent_watchdog_counts_exactly_once(ctx):
 
 
 def test_concurrent_same_stage_reports_no_double_count(ctx):
-    """并发同阶段重复上报：每个新 seq 恰好计一次，重复 seq 幂等不计。"""
+    """并发同阶段重复上报：游标与计数收敛一致，重复/迟到不多计。
+
+    25 个不同 seq（2..26）并发，线程拿锁顺序不保证与 seq 一致：
+    较小 seq 若晚于较大 seq 执行，会被正确地以 seq_regression 拒绝。
+    因此“被接受的新 seq 数 + 被迟到拒绝的 seq 数”恒等于 25，
+    stage_seq 最终必为最大 seq，且任何 seq 都不会把计数多计。
+    """
     c, _, tokens = ctx
     claim(c, tokens, "d0")
     c.progress.report("d0", tokens["d0"], "r1", "downloaded", 1)
@@ -218,18 +224,29 @@ def test_concurrent_same_stage_reports_no_double_count(ctx):
         except Exception as exc:  # noqa: BLE001
             errors.append((seq, getattr(exc, "code", str(exc))))
 
-    # 50 个并发上报：seq 2..26 各出现两次（一次新 seq、一次重复）
-    seqs = [s for s in range(2, 27) for _ in (0, 1)]
+    # 25 个不同 seq 并发（2..26），调度顺序不确定
+    seqs = list(range(2, 27))
     threads = [threading.Thread(target=worker, args=(s,)) for s in seqs]
     [t.start() for t in threads]
     [t.join() for t in threads]
 
-    assert errors == []
+    # 唯一允许的拒绝原因：乱序迟到（seq_regression）
+    assert all(code == "stale_report_rejected" for _, code in errors)
     st = c.store.update_states[("d0", "r1")]
     assert st.stage_seq == 26
-    # 25 个新 seq 的同阶段重复各计一次；重复 seq 走幂等分支不计
-    assert st.same_stage_reports == 25
+    # 接受的新 seq 各计一次；被迟到拒绝的不计：二者之和恰为发送总数，
+    # 任何 seq 都没有被计两次
+    assert st.same_stage_reports + len(errors) == 25
+    assert st.same_stage_reports == 26 - 1 - len(errors)
     assert c.rollouts.summary("r1")["stall"]["observing"] == 1
+
+    # 同 seq 同阶段重复上报：幂等，不计数、游标不动（确定性验证）
+    n_before = st.same_stage_reports
+    for _ in range(3):
+        v = c.progress.report("d0", tokens["d0"], "r1", "downloaded", 26)
+        assert v["duplicate"] is True
+    st = c.store.update_states[("d0", "r1")]
+    assert st.stage_seq == 26 and st.same_stage_reports == n_before
 
 
 def test_shelved_device_never_returns_to_normal(ctx):

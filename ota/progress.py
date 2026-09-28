@@ -12,8 +12,13 @@
 - seq 跳号                 -> 允许（设备可能合并中间上报），但阶段必须
                               不回退；回退阶段按倒退拒绝；
 - confirmed/failed/...    -> 终态后只接受相同阶段的幂等重放，其余拒绝；
-- shelved                 -> 一律以 device_shelved 拒绝，不得静默回到
-                              正常进度。
+                             只报失败（不带 stage）同样受终态锁定：
+                             CONFIRMED/ROLLED_BACK 后再报失败 -> 拒绝，
+                             FAILED 后同 seq 重发 -> 幂等、不重复计数，
+                             FAILED 后更大 seq 再报失败 -> 拒绝；
+- shelved                 -> 一律以 device_shelved 拒绝（普通上报与
+                             失败上报都一样），不得静默回到正常进度或
+                             覆盖已记录的搁置结论。
 
 “活着”与“在推进”分离：updated_at 随每次接受的上报刷新，
 stage_entered_at 只在阶段真正变化时刷新。看门狗据此识别两类停滞：
@@ -228,28 +233,100 @@ class ProgressService:
 
     def report_failure(self, device_id: str, token: str, rollout_id: str,
                        seq: int, error: str = "") -> dict:
-        devices, _ = self._services()
+        devices, rollouts = self._services()
         with self.store.lock:
+            self.store.ensure_loaded()
             devices.authenticate(device_id, token)
             state = self.store.update_states.get((device_id, rollout_id))
             if state is None:
                 raise RolloutValidationError(
                     "设备尚未认领该发布", details={"reason": "not_claimed"})
-            if seq <= state.stage_seq and state.stage != UpdateStage.FAILED:
+
+            old_stage = state.stage
+            # 0) 搁置设备：任何形式的上报（含只报失败）都明确拒绝，
+            #    已记录的搁置结论与搁置原因不得被后来的上报覆盖
+            if old_stage == UpdateStage.SHELVED:
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "device_shelved", "via": "failure_report",
+                    "input_seq": seq, "stage": old_stage.value})
+                raise StageTransitionError(
+                    f"设备已被搁置（{state.last_error or 'shelved'}），"
+                    f"拒绝失败上报 seq={seq}",
+                    details={"reason": "device_shelved",
+                             "stage": old_stage.value,
+                             "shelved_reason": state.last_error,
+                             "input_seq": seq})
+
+            # 1) 乱序/迟到：seq 回退（与普通上报同一判定）
+            if seq < state.stage_seq:
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "seq_regression", "via": "failure_report",
+                    "input_seq": seq, "accepted_seq": state.stage_seq,
+                    "stage": old_stage.value})
                 raise StaleReportError(
-                    "失败上报 seq 已过期", details={"reason": "seq_regression"})
+                    "失败上报 seq 已过期", details={"reason": "seq_regression",
+                                                    "input_seq": seq,
+                                                    "accepted_seq": state.stage_seq})
+
+            # 2) 已定局设备（confirmed/failed/rolled_back）：终态锁定
+            if old_stage in (UpdateStage.CONFIRMED, UpdateStage.FAILED,
+                             UpdateStage.ROLLED_BACK):
+                # 已失败设备重发同一条失败上报（同 seq）：幂等返回，
+                # 不当成新结果重复计数；其他终态/新 seq 一律拒绝
+                if old_stage == UpdateStage.FAILED \
+                        and seq == state.stage_seq:
+                    return self._view(state, duplicate=True)
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "terminal_stage_locked",
+                    "via": "failure_report",
+                    "input_seq": seq, "stage": old_stage.value})
+                raise StageTransitionError(
+                    f"设备已处于终态 {old_stage.value}，失败上报被拒绝",
+                    details={"reason": "terminal_stage_locked",
+                             "stage": old_stage.value,
+                             "input_stage": UpdateStage.FAILED.value,
+                             "input_seq": seq})
+
+            # 3) 与停滞巡检的竞态保护：设备补救机会已用尽且已满足停滞
+            #    （沉默超时或同阶段停滞）条件时，搁置结论优先于这条失败
+            #    上报生效——即使失败上报先拿到锁，巡检随后也只会跳过；
+            #    在这里让搁置先落定、再拒绝失败，保证两种线程顺序下结果
+            #    唯一（SHELVED 只落一次），不会出现搁置被失败覆盖。
+            verdict = self._stall_verdict(state, now())
+            if state.retries >= self.max_retries and verdict is not None:
+                reason, stuck_for = verdict
+                self._shelve_locked(state, rollouts, reason, stuck_for)
+                self.store.persist()
+                self.audit.record("progress_rejected", {
+                    "device_id": device_id, "rollout_id": rollout_id,
+                    "reason": "device_shelved", "via": "failure_report",
+                    "input_seq": seq, "stage": state.stage.value,
+                    "shelved_reason": state.last_error})
+                raise StageTransitionError(
+                    f"设备停滞补救用尽已搁置（{state.last_error}），"
+                    f"拒绝失败上报 seq={seq}",
+                    details={"reason": "device_shelved",
+                             "stage": state.stage.value,
+                             "shelved_reason": state.last_error,
+                             "input_seq": seq})
+
             state.stage = UpdateStage.FAILED
             state.stage_seq = max(seq, state.stage_seq)
             state.updated_at = now()
             state.last_error = error or "device_reported_failure"
+            state.stage_entered_at = state.updated_at
+            state.same_stage_reports = 0
             self.store.persist()
             self.audit.record("device_failed", {
                 "device_id": device_id, "rollout_id": rollout_id,
                 "seq": state.stage_seq, "error": state.last_error})
             log.warning("progress failure device=%s seq=%d error=%s",
                         device_id, state.stage_seq, state.last_error)
-            self.rollouts.record_outcome(rollout_id, device_id,
-                                         UpdateStage.FAILED)
+            rollouts.record_outcome(rollout_id, device_id,
+                                    UpdateStage.FAILED)
             return self._view(state, duplicate=False,
                               classification="failed")
 
@@ -292,53 +369,76 @@ class ProgressService:
                 if state.stage == UpdateStage.NONE \
                         and state.retries == 0:
                     continue
-                silent = ts - state.updated_at > self.stage_timeout
-                stalled = state.same_stage_reports > 0 \
-                    and ts - state.stage_entered_at > self.stall_window
-                if not (silent or stalled):
+                verdict = self._stall_verdict(state, ts)
+                if verdict is None:
                     continue
-                reason = "stalled_same_stage" if stalled else "silent_timeout"
-                stuck_for = ts - state.stage_entered_at
+                reason, stuck_for = verdict
                 if state.retries < self.max_retries:
-                    state.retries += 1
-                    prev = state.stage
-                    state.stage = UpdateStage.NONE
-                    state.updated_at = ts
-                    state.stage_entered_at = ts
-                    state.same_stage_reports = 0
+                    self._retry_locked(state, reason, stuck_for, ts)
                     retried.append(state.device_id)
-                    self.audit.record("watchdog_retry", {
-                        "device_id": state.device_id,
-                        "rollout_id": state.rollout_id,
-                        "from_stage": prev.value,
-                        "retries": state.retries,
-                        "reason": reason,
-                        "stuck_seconds": stuck_for})
-                    log.warning("watchdog retry device=%s stage=%s "
-                                "reason=%s stuck=%.0fs retries=%d",
-                                state.device_id, prev.value, reason,
-                                stuck_for, state.retries)
                 else:
-                    state.stage = UpdateStage.SHELVED
-                    state.updated_at = ts
-                    state.last_error = (
-                        f"shelved_after_{state.retries}_retries({reason})")
+                    self._shelve_locked(state, rollouts, reason, stuck_for,
+                                        ts)
                     shelved.append(state.device_id)
-                    self.audit.record("watchdog_shelved", {
-                        "device_id": state.device_id,
-                        "rollout_id": state.rollout_id,
-                        "retries": state.retries,
-                        "reason": reason,
-                        "stuck_seconds": stuck_for})
-                    log.error("watchdog shelve device=%s retries=%d "
-                              "reason=%s stuck=%.0fs", state.device_id,
-                              state.retries, reason, stuck_for)
-                    rollouts.record_outcome(
-                        state.rollout_id, state.device_id,
-                        UpdateStage.SHELVED)
             if retried or shelved:
                 self.store.persist()
         return {"retried": retried, "shelved": shelved}
+
+    # -------------------------------------------------------- stall helpers
+    def _stall_verdict(self, state, ts: float):
+        """调用方须持锁。返回 (reason, stuck_seconds)；未停滞返回 None。
+
+        - silent_timeout：updated_at 超过 stage_timeout 没有任何上报；
+        - stalled_same_stage：same_stage_reports>0（设备活着）且停在同一
+          阶段超过 stall_window。与 stalled 同时成立时归类 stalled。
+        """
+        silent = ts - state.updated_at > self.stage_timeout
+        stalled = state.same_stage_reports > 0 \
+            and ts - state.stage_entered_at > self.stall_window
+        if not (silent or stalled):
+            return None
+        reason = "stalled_same_stage" if stalled else "silent_timeout"
+        return reason, ts - state.stage_entered_at
+
+    def _retry_locked(self, state, reason: str, stuck_for: float,
+                      ts: float) -> None:
+        """调用方须持锁：补救一次（重置 NONE 续跑，retries+1）。"""
+        state.retries += 1
+        prev = state.stage
+        state.stage = UpdateStage.NONE
+        state.updated_at = ts
+        state.stage_entered_at = ts
+        state.same_stage_reports = 0
+        self.audit.record("watchdog_retry", {
+            "device_id": state.device_id, "rollout_id": state.rollout_id,
+            "from_stage": prev.value, "retries": state.retries,
+            "reason": reason, "stuck_seconds": stuck_for})
+        log.warning("watchdog retry device=%s stage=%s reason=%s "
+                    "stuck=%.0fs retries=%d", state.device_id, prev.value,
+                    reason, stuck_for, state.retries)
+
+    def _shelve_locked(self, state, rollouts, reason: str,
+                       stuck_for: float, ts: float | None = None) -> None:
+        """调用方须持锁：置 SHELVED 并计入批次结果。
+
+        巡检与失败上报共用本方法；状态机迁移、审计、批次计数在同一临界区
+        完成，并发调用方只有第一个能在非终态上执行（终态会在更早处被
+        拦截），因此搁置结论恰好落一次。
+        """
+        ts = now() if ts is None else ts
+        state.stage = UpdateStage.SHELVED
+        state.updated_at = ts
+        state.last_error = (
+            f"shelved_after_{state.retries}_retries({reason})")
+        self.audit.record("watchdog_shelved", {
+            "device_id": state.device_id, "rollout_id": state.rollout_id,
+            "retries": state.retries, "reason": reason,
+            "stuck_seconds": stuck_for})
+        log.error("watchdog shelve device=%s retries=%d reason=%s "
+                  "stuck=%.0fs", state.device_id, state.retries, reason,
+                  stuck_for)
+        rollouts.record_outcome(state.rollout_id, state.device_id,
+                                UpdateStage.SHELVED)
 
     # ------------------------------------------------------------ reconcile
     def reconcile(self, device_id: str, token: str, rollout_id: str,

@@ -61,7 +61,7 @@ uv run uvicorn main:app --reload
   对同一设备补救/搁置恰好一次；50 个并发同阶段上报中重复 seq 不多计；
 - 300 台设备规模：单趟巡检在 5s 内完成，一半恢复一半搁置时整批仍收敛。
 
-本地手动复现（虚拟时钟，无需真实等待）：
+本地手动复现停滞识别（虚拟时钟，无需真实等待）：
 
 ```bash
 uv run pytest tests/test_stall.py -q          # 仅停滞相关用例
@@ -85,6 +85,58 @@ for seq in range(2, 9):                        # 活着但不推进
           ["classification"])                  # same_stage_repeat
 print(c.progress.watchdog("r1"))               # {'retried': ['d1'], ...}
 print(c.rollouts.summary("r1")["stall"])       # remedying=1
+PY
+```
+
+### 5.2 已定局设备不被后续上报覆盖 — `tests/test_terminal_lock.py`
+- **搁置设备再发失败上报**（只报失败、不带阶段、seq 更大）：以
+  `device_shelved` 拒绝，设备状态、`last_error` 搁置原因、汇总
+  `stall.shelved` 计数/原因、批次成功/失败计数全部保持不变；
+- 正常完成（confirmed）、整批回滚（rolled_back）后再发失败上报：
+  `terminal_stage_locked` 拒绝，已提交版本不回退；
+- 已失败（failed）设备重发同一条失败（同 seq）：幂等返回
+  `duplicate=true`，不重复计数、不重复写审计；更大 seq 再报失败 →
+  `terminal_stage_locked`；seq 回退 → `seq_regression`；
+- **并发**：8 条失败上报与停滞巡检同时作用于一台停滞设备，最终必为
+  SHELVED、`watchdog_shelved` 事件恰好一条、无 `device_failed`，
+  批次照常 DONE、后续批次推进、发布完成；8 条失败上报并发作用于一台
+  活跃设备，恰好一条生效、批次失败只计一次，其余被明确拒绝（可区分
+  `terminal_stage_locked` / `seq_regression`）。
+
+本地手动复现（虚拟时钟，无需真实等待）：
+
+```bash
+uv run pytest tests/test_terminal_lock.py -q          # 仅定局保护用例
+uv run python - << 'PY'
+from ota.app import AppContext
+from ota.clock import set_source
+from ota.errors import StageTransitionError
+import tempfile
+t = [100.0]; set_source(lambda: t[0])
+c = AppContext(tempfile.mkdtemp(), stage_timeout=30, max_retries=1,
+               stall_window=60)
+tok = c.devices.register("d1", "A1", "h1", "1.0.0")["token"]
+c.firmwares.create("fw2", "2.0.0", "A1", "h1", ["1.0.0"])
+c.rollouts.create("r1", "fw2", ["d1"], batch_size=1,
+                  failure_rate_threshold=1.0)
+c.rollouts.start("r1")
+c.rollouts.claim("r1", "d1", tok)
+c.progress.report("d1", tok, "r1", "downloaded", 1)
+for seq in range(2, 9):                       # 第一轮停滞 -> 补救
+    t[0] += 10
+    c.progress.report("d1", tok, "r1", "downloaded", seq)
+c.progress.watchdog("r1")
+c.progress.report("d1", tok, "r1", "downloaded", 20)
+for seq in range(21, 28):                     # 第二轮停滞 -> 搁置
+    t[0] += 10
+    c.progress.report("d1", tok, "r1", "downloaded", seq)
+c.progress.watchdog("r1")
+print(c.rollouts.summary("r1")["stall"]["shelved"])   # 1
+try:                                          # 后来只报失败、seq 更大
+    c.progress.report_failure("d1", tok, "r1", 99, "late_boom")
+except StageTransitionError as e:
+    print(e.code, e.details["reason"])        # device_shelved
+print(c.rollouts.summary("r1")["stall"]["shelved"])   # 仍是 1，结论未被覆盖
 PY
 ```
 

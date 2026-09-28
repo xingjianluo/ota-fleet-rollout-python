@@ -176,3 +176,42 @@ def test_watchdog_and_reconcile_http(client):
     assert rr.json()["stage"] == "none"
     assert rr.json()["client_is_behind"] is True
     assert rr.json()["accepted_seq"] == 1
+
+
+def test_shelved_device_failure_report_rejected_over_http(client):
+    """搁置后不带 stage 的失败上报走 HTTP 也被明确拒绝，汇总不变。"""
+    c, ctx, clock = client
+    tokens = {f"d{i}": register(c, f"d{i}") for i in range(2)}
+    make_firmwares(c)
+    c.post("/rollouts", json={"rollout_id": "r1", "fw_id": "fw2",
+                              "device_ids": ["d0", "d1"], "batch_size": 2,
+                              "failure_rate_threshold": 1.0})
+    c.post("/rollouts/r1/start")
+    c.post("/rollouts/r1/claim/d0", json={"token": tokens["d0"]})
+    c.post("/rollouts/r1/claim/d1", json={"token": tokens["d1"]})
+    for i, st in enumerate(["downloaded", "installed", "rebooted",
+                            "confirmed"], start=1):
+        c.post("/rollouts/r1/report/d0",
+               json={"token": tokens["d0"], "seq": i, "stage": st})
+    # d1：两轮沉默超时 -> 补救用尽 -> 搁置
+    c.post("/rollouts/r1/report/d1",
+           json={"token": tokens["d1"], "seq": 1, "stage": "downloaded"})
+    clock.t += 31
+    assert c.post("/rollouts/r1/watchdog").json()["retried"] == ["d1"]
+    clock.t += 31
+    assert c.post("/rollouts/r1/watchdog").json()["shelved"] == ["d1"]
+
+    before = c.get("/rollouts/r1").json()
+    assert before["stall"]["shelved"] == 1
+
+    # 只报失败、不带 stage、seq 更大 -> 422 device_shelved
+    r = c.post("/rollouts/r1/report/d1",
+               json={"token": tokens["d1"], "seq": 99, "error": "late"})
+    assert r.status_code == 422
+    body = r.json()
+    assert body["code"] == "stage_transition_rejected"
+    assert body["details"]["reason"] == "device_shelved"
+
+    after = c.get("/rollouts/r1").json()
+    assert after["stall"] == before["stall"]
+    assert after["batches"] == before["batches"]

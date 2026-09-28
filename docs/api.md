@@ -21,6 +21,10 @@
 | POST | `/rollouts/{id}/report/{device_id}` | 阶段上报；不带 `stage` 视为失败上报 |
 | POST | `/rollouts/{id}/reconcile/{device_id}` | 重连对账 |
 | POST | `/rollouts/{id}/watchdog` | 触发一次看门狗/停滞巡检（幂等） |
+| POST | `/rollback/device/{id}` | 单设备回滚 |
+| POST | `/rollouts/{id}/rollback-batch/{index}` | 整批回滚（全有或全无） |
+| GET | `/rollback/records` | 回滚批准/拒绝追溯 |
+| GET | `/audit?limit=N` | 审计事件 |
 
 ### 上报响应的判定分类
 
@@ -42,10 +46,6 @@
 `shelved`（补救用尽已搁置）三档计数，`reasons` 给出每档每台设备的
 具体原因。判定规则详见
 [state-machine.md](state-machine.md)。
-| POST | `/rollback/device/{id}` | 单设备回滚 |
-| POST | `/rollouts/{id}/rollback-batch/{index}` | 整批回滚（全有或全无） |
-| GET | `/rollback/records` | 回滚批准/拒绝追溯 |
-| GET | `/audit?limit=N` | 审计事件 |
 
 错误响应统一为：
 
@@ -71,7 +71,7 @@
 | `rollout_validation_failed` | 422 | `incompatible_members`（带每台设备原因）、`no_devices`、`bad_batch_size`、`bad_threshold`、`unknown_rollout` |
 | `rollout_state_conflict` | 409 | `not_pending` / `not_in_progress` / `not_resumable` |
 | `batch_state_conflict` | 409 | `not_current_batch` / `batch_full` / `rollout_paused` / `rollout_auto_halted` / `already_terminal` / `device_shelved` / `no_active_batch` |
-| `stage_transition_rejected` | 422 | `terminal_stage_locked` / `device_shelved` / `stage_regression` / `same_seq_conflicting_stage` / `unknown_stage` |
+| `stage_transition_rejected` | 422 | `terminal_stage_locked`（定局后再迁移/再报失败）/ `device_shelved`（搁置后任何上报或认领）/ `stage_regression` / `same_seq_conflicting_stage` / `unknown_stage` |
 | `stale_report_rejected` | 409 | `seq_regression` |
 | `rollback_rejected` | 422 | `device_mid_update_not_rollbackable` / `already_on_target_version` / `target_newer_than_current` / `batch_precheck_blocked` / `missing_idem_key` / `bad_batch_index` / `empty_batch_no_devices` |
 | `rollback_duplicate` | 409 | `already_rolled_back_to_target` |
